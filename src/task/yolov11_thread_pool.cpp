@@ -8,6 +8,7 @@
 Yolov11ThreadPool::Yolov11ThreadPool()
 {
     stop_ = false;
+    draw_result_ = true;
 }
 
 Yolov11ThreadPool::~Yolov11ThreadPool()
@@ -72,16 +73,15 @@ nn_error_e Yolov11ThreadPool::setUp(std::string &model_path,
 
 void Yolov11ThreadPool::worker(int id)
 {
-    while (!stop_)
+    while (!stop_.load())
     {
         std::pair<int, cv::Mat> task;
         {
-            // 等待读帧线程提交任务，stop_ 置位后唤醒并退出。
             std::unique_lock<std::mutex> lock(task_mutex_);
             cv_task_.wait(lock, [&]
-                          { return !tasks_.empty() || stop_; });
+                          { return !tasks_.empty() || stop_.load(); });
 
-            if (stop_)
+            if (stop_.load())
             {
                 return;
             }
@@ -92,16 +92,18 @@ void Yolov11ThreadPool::worker(int id)
 
         std::vector<Detection> detections;
         auto instance = yolo_instances_[id];
-        // 推理耗时主要发生在这里，多个 worker 会并行调用各自的 RKNN context。
         instance->Run(task.second, detections);
 
         {
-            // 结果按帧号存入 map，取结果线程可以按原始帧序阻塞等待。
+            // benchmark 模式只保存检测框，不画图也不缓存图像，减少 CPU 和内存带宽占用。
             std::lock_guard<std::mutex> lock(result_mutex_);
             results_[task.first] = detections;
-            img_source_[task.first] = task.second;
-            DrawDetections(task.second, detections);
-            img_results_[task.first] = task.second;
+            if (draw_result_.load())
+            {
+                img_source_[task.first] = task.second;
+                DrawDetections(task.second, detections);
+                img_results_[task.first] = task.second;
+            }
         }
         cv_task_.notify_all();
     }
@@ -109,22 +111,26 @@ void Yolov11ThreadPool::worker(int id)
 
 nn_error_e Yolov11ThreadPool::submitTask(const cv::Mat &img, int id)
 {
-    while (true)
+    while (!stop_.load())
     {
         {
             std::lock_guard<std::mutex> lock(task_mutex_);
+            if (stop_.load())
+            {
+                return NN_STOPED;
+            }
             if (tasks_.size() <= 10)
             {
                 tasks_.push({id, img});
-                break;
+                cv_task_.notify_one();
+                return NN_SUCCESS;
             }
         }
         // 限制队列长度，防止视频读取过快时内存持续增长。
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    cv_task_.notify_one();
-    return NN_SUCCESS;
+    return NN_STOPED;
 }
 
 nn_error_e Yolov11ThreadPool::getTargetResult(std::vector<Detection> &objects, int id)
@@ -132,7 +138,6 @@ nn_error_e Yolov11ThreadPool::getTargetResult(std::vector<Detection> &objects, i
     while (true)
     {
         {
-            // 阻塞等待指定帧号的检测框结果。
             std::lock_guard<std::mutex> lock(result_mutex_);
             auto it = results_.find(id);
             if (it != results_.end())
@@ -154,7 +159,6 @@ nn_error_e Yolov11ThreadPool::getTargetImgResult(cv::Mat &img, int id)
     while (true)
     {
         {
-            // 视频 demo 用这个接口取已经画好框的图像。
             std::lock_guard<std::mutex> lock(result_mutex_);
             auto it = img_results_.find(id);
             if (it != img_results_.end())
@@ -192,6 +196,23 @@ nn_error_e Yolov11ThreadPool::getTargetResultNonBlock(std::vector<Detection> &ob
     return NN_SUCCESS;
 }
 
+nn_error_e Yolov11ThreadPool::getAnyTargetResultNonBlock(std::vector<Detection> &objects, int &id)
+{
+    std::lock_guard<std::mutex> lock(result_mutex_);
+    if (results_.empty())
+    {
+        return NN_RESULT_NOT_READY;
+    }
+
+    auto it = results_.begin();
+    id = it->first;
+    objects = it->second;
+    results_.erase(it);
+    img_results_.erase(id);
+    img_source_.erase(id);
+    return NN_SUCCESS;
+}
+
 nn_error_e Yolov11ThreadPool::getTargetResultNonBlockAndSourceImg(std::vector<Detection> &objects, cv::Mat &img, int id)
 {
     std::lock_guard<std::mutex> lock(result_mutex_);
@@ -207,6 +228,11 @@ nn_error_e Yolov11ThreadPool::getTargetResultNonBlockAndSourceImg(std::vector<De
     img_results_.erase(id);
     img_source_.erase(id);
     return NN_SUCCESS;
+}
+
+void Yolov11ThreadPool::setDrawResult(bool enabled)
+{
+    draw_result_ = enabled;
 }
 
 void Yolov11ThreadPool::stopAll()

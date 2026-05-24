@@ -3,6 +3,7 @@
 
 #include "yolov11_custom.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <map>
 #include <memory>
@@ -28,7 +29,9 @@ public:
     nn_error_e getTargetResult(std::vector<Detection> &objects, int id);
     nn_error_e getTargetImgResult(cv::Mat &img, int id);
     nn_error_e getTargetResultNonBlock(std::vector<Detection> &objects, int id);
+    nn_error_e getAnyTargetResultNonBlock(std::vector<Detection> &objects, int &id);
     nn_error_e getTargetResultNonBlockAndSourceImg(std::vector<Detection> &objects, cv::Mat &img, int id);
+    void setDrawResult(bool enabled);
     void stopAll();
 
 private:
@@ -46,7 +49,8 @@ private:
     std::mutex task_mutex_;
     std::mutex result_mutex_;
     std::condition_variable cv_task_;
-    bool stop_;
+    std::atomic<bool> stop_;
+    std::atomic<bool> draw_result_;
 };
 
 #endif // RK3588_DEMO_YOLOV11_THREAD_POOL_H

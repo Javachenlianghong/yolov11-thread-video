@@ -3,7 +3,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
-#include <map>
 #include <memory>
 #include <opencv2/opencv.hpp>
 #include <sstream>
@@ -27,6 +26,9 @@ struct VideoDemoConfig
     std::string output_path{"thread_pool_demo.mp4"};
     bool record{true};
     bool show_window{false};
+    bool benchmark{false};
+    bool loop_video{false};
+    int benchmark_seconds{30};
     int threads{3};
     int class_num{80};
     float box_thresh{0.25f};
@@ -127,6 +129,18 @@ static bool load_config_file(const std::string &config_path, VideoDemoConfig &co
         {
             config.show_window = parse_bool(value);
         }
+        else if (key == "benchmark")
+        {
+            config.benchmark = parse_bool(value);
+        }
+        else if (key == "loop_video")
+        {
+            config.loop_video = parse_bool(value);
+        }
+        else if (key == "benchmark_seconds" || key == "benchmark_duration")
+        {
+            config.benchmark_seconds = std::atoi(value.c_str());
+        }
         else if (key == "threads")
         {
             config.threads = std::atoi(value.c_str());
@@ -155,10 +169,9 @@ static void print_usage(const char *program)
 {
     printf("Usage:\n");
     printf("  %s [config.ini]\n", program);
-    printf("  %s <yolo11.rknn> <video_path|camera_id> [record 0/1] [threads 3] [labels_path] [class_num] [box_thresh] [nms_thresh] [show_window 0/1] [output_path]\n", program);
+    printf("  %s <yolo11.rknn> <video_path|camera_id> [record 0/1] [threads 3] [labels_path] [class_num] [box_thresh] [nms_thresh] [show_window 0/1] [output_path] [benchmark 0/1] [benchmark_seconds 30]\n", program);
 }
 
-// 纯数字输入按摄像头编号处理，例如 0；其他输入按视频文件路径处理。
 static bool is_camera_id(const char *value)
 {
     if (value == nullptr || value[0] == '\0')
@@ -184,13 +197,28 @@ static cv::VideoCapture open_capture(const char *video_file)
     return cv::VideoCapture(video_file);
 }
 
-static void get_results(bool record, bool show_window, double fps, std::string output_path)
+static bool benchmark_time_over(const VideoDemoConfig &config,
+                                const std::chrono::steady_clock::time_point &start)
+{
+    if (!config.benchmark || config.benchmark_seconds <= 0)
+    {
+        return false;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    int elapsed = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(now - start).count());
+    return elapsed >= config.benchmark_seconds;
+}
+
+static void get_ordered_results(const VideoDemoConfig &config, double fps)
 {
     auto start_all = std::chrono::high_resolution_clock::now();
     int frame_count = 0;
     std::string fps_str;
 
     cv::VideoWriter writer;
+    bool record = config.record;
+    bool show_window = config.show_window;
     if (show_window)
     {
         try
@@ -212,7 +240,6 @@ static void get_results(bool record, bool show_window, double fps, std::string o
             break;
         }
 
-        // 读帧线程已经结束，并且所有提交过的帧都取回结果后退出。
         if (g_read_end.load() && g_frame_end_id.load() >= g_frame_start_id.load())
         {
             break;
@@ -220,7 +247,6 @@ static void get_results(bool record, bool show_window, double fps, std::string o
 
         cv::Mat img;
         const int frame_id = g_frame_end_id.load();
-        // 按帧号顺序取结果，避免多线程推理完成顺序不同导致视频乱序。
         auto ret = g_yolov11_thread_pool->getTargetImgResult(img, frame_id);
         if (ret != NN_SUCCESS)
         {
@@ -237,7 +263,6 @@ static void get_results(bool record, bool show_window, double fps, std::string o
         auto elapsed_ms = std::chrono::duration_cast<std::chrono::microseconds>(now - start_all).count() / 1000.0f;
         if (elapsed_ms > 1000.0f)
         {
-            // 每秒统计一次实际端到端处理帧率，包含取结果和写视频的时间。
             float fps_value = frame_count / (elapsed_ms / 1000.0f);
             NN_LOG_INFO("thread_pool_demo FPS:%f, Frame Count:%d", fps_value, frame_count);
             fps_str = std::to_string(static_cast<int>(fps_value)) + " FPS";
@@ -245,21 +270,17 @@ static void get_results(bool record, bool show_window, double fps, std::string o
             start_all = std::chrono::high_resolution_clock::now();
         }
 
-        if (record)
+        if (record && !writer.isOpened())
         {
+            double output_fps = fps > 1.0 ? fps : 30.0;
+            writer.open(config.output_path,
+                        cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+                        output_fps,
+                        img.size());
             if (!writer.isOpened())
             {
-                // 延迟到拿到第一帧后再创建 VideoWriter，保证输出尺寸和处理后图像一致。
-                double output_fps = fps > 1.0 ? fps : 30.0;
-                writer.open(output_path,
-                            cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
-                            output_fps,
-                            img.size());
-                if (!writer.isOpened())
-                {
-                    NN_LOG_ERROR("failed to open output video: %s", output_path.c_str());
-                    record = false;
-                }
+                NN_LOG_ERROR("failed to open output video: %s", config.output_path.c_str());
+                record = false;
             }
         }
 
@@ -290,12 +311,9 @@ static void get_results(bool record, bool show_window, double fps, std::string o
             }
         }
 
-        if (record)
+        if (record && writer.isOpened())
         {
-            if (writer.isOpened())
-            {
-                writer << img;
-            }
+            writer << img;
         }
     }
 
@@ -311,7 +329,64 @@ static void get_results(bool record, bool show_window, double fps, std::string o
     NN_LOG_INFO("get_results end.");
 }
 
-static void read_video(const char *video_file)
+static void get_benchmark_results(const VideoDemoConfig &config)
+{
+    auto start = std::chrono::steady_clock::now();
+    auto last = start;
+    int frame_count = 0;
+    int detect_count = 0;
+
+    while (!g_user_stop.load())
+    {
+        if (benchmark_time_over(config, start))
+        {
+            g_user_stop = true;
+            g_read_end = true;
+            break;
+        }
+
+        std::vector<Detection> objects;
+        int frame_id = -1;
+        auto ret = g_yolov11_thread_pool->getAnyTargetResultNonBlock(objects, frame_id);
+        if (ret == NN_SUCCESS)
+        {
+            g_frame_end_id++;
+            frame_count++;
+            detect_count += static_cast<int>(objects.size());
+        }
+        else
+        {
+            if (g_read_end.load() && g_frame_end_id.load() >= g_frame_start_id.load())
+            {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::microseconds>(now - last).count() / 1000.0f;
+        if (elapsed_ms > 1000.0f)
+        {
+            float fps_value = frame_count / (elapsed_ms / 1000.0f);
+            int submitted = g_frame_start_id.load();
+            int completed = g_frame_end_id.load();
+            NN_LOG_INFO("benchmark FPS:%f, Submitted:%d, Done:%d, Pending:%d, Detections:%d",
+                        fps_value,
+                        submitted,
+                        completed,
+                        submitted - completed,
+                        detect_count);
+            frame_count = 0;
+            detect_count = 0;
+            last = now;
+        }
+    }
+
+    g_yolov11_thread_pool->stopAll();
+    NN_LOG_INFO("benchmark end. submitted=%d, done=%d", g_frame_start_id.load(), g_frame_end_id.load());
+}
+
+static void read_video(const char *video_file, bool loop_video)
 {
     cv::VideoCapture cap = open_capture(video_file);
     if (!cap.isOpened())
@@ -332,14 +407,23 @@ static void read_video(const char *video_file)
         cap >> img;
         if (img.empty())
         {
+            if (loop_video && !is_camera_id(video_file))
+            {
+                cap.set(cv::CAP_PROP_POS_FRAMES, 0);
+                continue;
+            }
+
             NN_LOG_INFO("video end.");
             g_read_end = true;
             break;
         }
 
         int id = g_frame_start_id++;
-        // clone 后提交，避免 OpenCV 复用内部缓冲导致工作线程读到被覆盖的帧。
-        g_yolov11_thread_pool->submitTask(img.clone(), id);
+        auto ret = g_yolov11_thread_pool->submitTask(img.clone(), id);
+        if (ret != NN_SUCCESS)
+        {
+            break;
+        }
     }
 
     g_read_end = true;
@@ -378,19 +462,33 @@ int main(int argc, char **argv)
         config.nms_thresh = argc > 8 ? static_cast<float>(atof(argv[8])) : 0.45f;
         config.show_window = argc > 9 ? atoi(argv[9]) != 0 : false;
         config.output_path = argc > 10 ? argv[10] : "thread_pool_demo.mp4";
+        config.benchmark = argc > 11 ? atoi(argv[11]) != 0 : false;
+        config.benchmark_seconds = argc > 12 ? atoi(argv[12]) : 30;
     }
 
     if (config.threads <= 0)
     {
-        // RK3588 有 3 个 NPU core，默认使用 3 个 RKNN 上下文比较稳。
         config.threads = 3;
+    }
+    if (config.benchmark)
+    {
+        // benchmark 模式只测推理流水线吞吐：不保存、不显示、不画框，并循环视频让 NPU 持续有输入。
+        config.record = false;
+        config.show_window = false;
+        config.loop_video = !is_camera_id(config.video_source.c_str());
+        if (config.benchmark_seconds <= 0)
+        {
+            config.benchmark_seconds = 30;
+        }
     }
 
     NN_LOG_INFO("model_path: %s", config.model_path.c_str());
     NN_LOG_INFO("video_source: %s", config.video_source.c_str());
-    NN_LOG_INFO("record: %d, show_window: %d, threads: %d, output_path: %s",
+    NN_LOG_INFO("record: %d, show_window: %d, benchmark: %d, loop_video: %d, threads: %d, output_path: %s",
                 config.record ? 1 : 0,
                 config.show_window ? 1 : 0,
+                config.benchmark ? 1 : 0,
+                config.loop_video ? 1 : 0,
                 config.threads,
                 config.output_path.c_str());
 
@@ -403,7 +501,6 @@ int main(int argc, char **argv)
     g_read_end = false;
     g_user_stop = false;
 
-    // 线程池会为每个线程创建独立 RKNN 上下文，并轮流绑定 NPU core 0/1/2。
     g_yolov11_thread_pool.reset(new Yolov11ThreadPool());
     auto ret = g_yolov11_thread_pool->setUp(config.model_path,
                                             config.threads,
@@ -415,10 +512,18 @@ int main(int argc, char **argv)
     {
         return ret;
     }
+    g_yolov11_thread_pool->setDrawResult(!config.benchmark);
 
-    // 一个线程负责读视频提交任务，一个线程负责按帧号取结果和写视频。
-    std::thread read_video_thread(read_video, config.video_source.c_str());
-    std::thread result_thread(get_results, config.record, config.show_window, fps, config.output_path);
+    std::thread read_video_thread(read_video, config.video_source.c_str(), config.loop_video);
+    std::thread result_thread;
+    if (config.benchmark)
+    {
+        result_thread = std::thread(get_benchmark_results, config);
+    }
+    else
+    {
+        result_thread = std::thread(get_ordered_results, config, fps);
+    }
 
     read_video_thread.join();
     result_thread.join();

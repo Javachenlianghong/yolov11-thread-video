@@ -1,20 +1,20 @@
 # RK3588 YOLO11 多线程视频推理 Demo
 
-这是一个精简后的 RK3588 YOLO11 推理工程，只保留本地图片和本地视频/USB 摄像头推理。
+这是一个精简后的 RK3588 YOLO11 推理工程，只保留本地图片推理和本地视频/USB 摄像头推理。
 
 保留的 demo：
 
 - `img_demo`：单张图片推理
-- `thread_pool_demo`：本地视频或 USB 摄像头多线程推理，使用多个 RKNN 上下文并行跑 NPU
+- `thread_pool_demo`：本地视频或 USB 摄像头多线程推理，使用多个 RKNN context 并行跑 NPU
 
 已移除内容：
 
-- 网络推流服务相关代码
+- RTSP 推流服务相关代码
 - MPP 编解码相关代码
 - MediaKit 相关代码
-- ini 推流配置文件
+- 原推流配置文件
 
-YOLO11 后处理参考瑞芯微官方样例：
+YOLO11 后处理参考 Rockchip 官方样例：
 
 https://github.com/airockchip/rknn_model_zoo/tree/main/examples/yolo11
 
@@ -30,12 +30,6 @@ make -j4
 ```
 
 运行前设置动态库路径：
-
-```sh
-export LD_LIBRARY_PATH=../librknn_api/aarch64:../3rdparty/rga/RK3588/lib/Linux/aarch64:$LD_LIBRARY_PATH
-```
-
-如果在 `build` 目录运行，并且可执行文件需要加载当前目录下的工程动态库，也可以使用：
 
 ```sh
 export LD_LIBRARY_PATH=.:../librknn_api/aarch64:../3rdparty/rga/RK3588/lib/Linux/aarch64:$LD_LIBRARY_PATH
@@ -90,6 +84,9 @@ labels_path=../coco_80_labels_list.txt
 record=1
 show_window=0
 output_path=thread_pool_demo.mp4
+benchmark=0
+benchmark_seconds=30
+loop_video=0
 threads=3
 class_num=80
 box_thresh=0.25
@@ -104,15 +101,54 @@ nms_thresh=0.45
 - `record`：是否保存结果视频，`1` 保存，`0` 不保存
 - `show_window`：是否弹窗显示，`1` 显示，`0` 不显示
 - `output_path`：结果视频保存路径，仅 `record=1` 时生效
-- `threads`：推理线程数，RK3588 建议先用 `3`
+- `benchmark`：非阻塞性能测试模式，`1` 开启，`0` 关闭
+- `benchmark_seconds`：benchmark 持续时间，单位秒
+- `loop_video`：普通模式下是否循环视频；benchmark 模式下文件视频会自动循环
+- `threads`：推理线程数，RK3588 建议分别测试 `3`、`6`、`9`、`12`
 - `class_num`：类别数量，COCO 为 `80`
-- `box_thresh`：检测框置信度阈值
+- `box_thresh`：检测框置信度阈值；9 输出 YOLO11 的 `score_sum` 快速过滤也使用该阈值
 - `nms_thresh`：NMS 阈值
 
-弹窗显示说明：
+## 弹窗显示
 
 - `show_window=0`：不弹窗，只推理/保存视频，适合 SSH 或无桌面环境
-- `show_window=1`：弹出 OpenCV 窗口按原视频帧尺寸显示推理结果，窗口中按 `q` 或 `Esc` 退出
+- `show_window=1`：弹出 OpenCV 窗口，按原视频帧尺寸显示推理结果，窗口中按 `q` 或 `Esc` 退出
+
+## 非阻塞 benchmark 模式
+
+开启：
+
+```ini
+benchmark=1
+threads=12
+benchmark_seconds=30
+```
+
+运行：
+
+```sh
+./thread_pool_demo ../thread_pool_demo_config.ini
+```
+
+benchmark 模式会自动：
+
+- 关闭 `record`
+- 关闭 `show_window`
+- 关闭画框和图像结果缓存
+- 对文件视频自动循环
+- 非阻塞回收任意已完成结果，不再按帧号等待，减少结果线程对推理流水线的回压
+
+日志示例：
+
+```text
+[NN_INFO] benchmark FPS:120.312500, Submitted:3600, Done:3588, Pending:12, Detections:42
+```
+
+这组日志适合配合下面命令观察 NPU：
+
+```sh
+watch -n 1 sudo cat /sys/kernel/debug/rknpu/load
+```
 
 仍然兼容旧的命令行方式：
 
@@ -120,24 +156,16 @@ nms_thresh=0.45
 ./thread_pool_demo ../weights/yolo11n.rknn ../medias/palace.mp4 1 3 ../coco_80_labels_list.txt 80 0.25 0.45 0 thread_pool_demo.mp4
 ```
 
+新命令行参数也可以打开 benchmark：
+
+```sh
+./thread_pool_demo ../weights/yolo11n.rknn ../medias/palace.mp4 0 12 ../coco_80_labels_list.txt 80 0.25 0.45 0 thread_pool_demo.mp4 1 30
+```
+
 参数说明：
 
 ```text
-thread_pool_demo <yolo11.rknn> <video_path|camera_id> [record 0/1] [threads 3] [labels_path] [class_num] [box_thresh] [nms_thresh] [show_window 0/1] [output_path]
-```
-
-示例：
-
-```sh
-./thread_pool_demo ../weights/yolo11n.rknn ../medias/palace.mp4 1 3
-./thread_pool_demo ../weights/yolo11n.rknn 0 0 3
-./thread_pool_demo ../weights/yolo11n.rknn ../medias/palace.mp4 0 3 ../coco_80_labels_list.txt 80 0.25 0.45 1
-```
-
-当 `record` 为 `1` 时，结果视频保存为：
-
-```sh
-thread_pool_demo.mp4
+thread_pool_demo <yolo11.rknn> <video_path|camera_id> [record 0/1] [threads 3] [labels_path] [class_num] [box_thresh] [nms_thresh] [show_window 0/1] [output_path] [benchmark 0/1] [benchmark_seconds 30]
 ```
 
 ## 模型说明
@@ -149,7 +177,7 @@ thread_pool_demo.mp4
 - `6` 个输出：三个尺度，每个尺度包含 `box, class`
 - `9` 个输出：三个尺度，每个尺度包含 `box, class, score_sum`
 
-本工程同时支持 `6` 输出和 `9` 输出。`score_sum` 分支在后处理中会被忽略，这一点和瑞芯微官方 Python 样例保持一致。
+本工程同时支持 `6` 输出和 `9` 输出。对于 `9` 输出模型，后处理会使用 `score_sum` 分支先过滤低分网格点，再扫描类别分支和做 DFL 解码，减少 CPU 后处理开销。对于 `6` 输出模型，没有 `score_sum` 时会退化为直接扫描类别分支。
 
 不支持原始未优化的 YOLO11 单输出 RKNN 模型。
 
@@ -173,4 +201,4 @@ weights/yolo11n.rknn
 验证结果：
 
 - `img_demo` 跑通 `medias/bus.jpg`，生成 `result.jpg`
-- `thread_pool_demo` 跑通 `medias/palace.mp4`，3 线程推理，生成 `thread_pool_demo.mp4`
+- `thread_pool_demo` 跑通 `medias/palace.mp4`，支持普通保存视频模式和非阻塞 benchmark 模式

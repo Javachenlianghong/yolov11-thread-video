@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "utils/logging.h"
 
@@ -29,7 +30,6 @@ namespace yolo
 
     static inline float Dequant(const tensor_data_s &tensor, int offset)
     {
-        // int8/uint8 输出用张量自己的 zp 和 scale 反量化，float 输出直接读取。
         switch (tensor.attr.type)
         {
         case NN_TENSOR_FLOAT:
@@ -51,9 +51,52 @@ namespace yolo
         }
     }
 
+    static inline int8_t QuantizeThresholdI8(float value, int32_t zp, float scale)
+    {
+        if (scale <= 0.0f)
+        {
+            return std::numeric_limits<int8_t>::max();
+        }
+
+        int q = static_cast<int>(std::round(value / scale + static_cast<float>(zp)));
+        q = std::max(static_cast<int>(std::numeric_limits<int8_t>::min()),
+                     std::min(static_cast<int>(std::numeric_limits<int8_t>::max()), q));
+        return static_cast<int8_t>(q);
+    }
+
+    static inline uint8_t QuantizeThresholdU8(float value, int32_t zp, float scale)
+    {
+        if (scale <= 0.0f)
+        {
+            return std::numeric_limits<uint8_t>::max();
+        }
+
+        int q = static_cast<int>(std::round(value / scale + static_cast<float>(zp)));
+        q = std::max(static_cast<int>(std::numeric_limits<uint8_t>::min()),
+                     std::min(static_cast<int>(std::numeric_limits<uint8_t>::max()), q));
+        return static_cast<uint8_t>(q);
+    }
+
+    static inline bool TensorValuePassThreshold(const tensor_data_s &tensor, int offset, float threshold)
+    {
+        // score_sum 只有 1 个通道，先用它过滤低分网格点，避免无效的 80 类扫描和 DFL 解码。
+        switch (tensor.attr.type)
+        {
+        case NN_TENSOR_FLOAT:
+            return reinterpret_cast<float *>(tensor.data)[offset] >= threshold;
+        case NN_TENSOR_UINT8:
+            return reinterpret_cast<uint8_t *>(tensor.data)[offset] >=
+                   QuantizeThresholdU8(threshold, tensor.attr.zp, tensor.attr.scale);
+        case NN_TENSOR_INT8:
+            return reinterpret_cast<int8_t *>(tensor.data)[offset] >=
+                   QuantizeThresholdI8(threshold, tensor.attr.zp, tensor.attr.scale);
+        default:
+            return Dequant(tensor, offset) >= threshold;
+        }
+    }
+
     static inline bool GetTensorShape(const tensor_data_s &tensor, int &channels, int &height, int &width, bool &nchw)
     {
-        // RK3588 常见输出为 NCHW；这里也兼容 NHWC，方便换不同导出配置。
         if (tensor.attr.n_dims != 4)
         {
             NN_LOG_ERROR("unsupported YOLO11 output dims: %d", tensor.attr.n_dims);
@@ -104,7 +147,7 @@ namespace yolo
                                    int y,
                                    int x)
     {
-        // 根据输出布局计算一维 buffer 偏移，避免后处理写死 NCHW。
+        (void)tensor;
         if (nchw)
         {
             return channel * height * width + y * width + x;
@@ -153,12 +196,98 @@ namespace yolo
         }
     }
 
+    static bool FindMaxClassScore(const tensor_data_s &score_tensor,
+                                  bool score_nchw,
+                                  int score_channels,
+                                  int score_h,
+                                  int score_w,
+                                  int y,
+                                  int x,
+                                  int cls_count,
+                                  int &class_id,
+                                  float &max_score)
+    {
+        // 量化模型先在原始 int8/uint8 值域比较，最后只反量化最大值，降低 CPU 后处理开销。
+        class_id = -1;
+        max_score = 0.0f;
+
+        if (score_tensor.attr.type == NN_TENSOR_INT8)
+        {
+            const int8_t threshold = QuantizeThresholdI8(objectThreshold, score_tensor.attr.zp, score_tensor.attr.scale);
+            const int8_t *scores = reinterpret_cast<int8_t *>(score_tensor.data);
+            int8_t max_raw = std::numeric_limits<int8_t>::min();
+            int max_offset = -1;
+
+            for (int c = 0; c < cls_count; c++)
+            {
+                int offset = TensorOffset(score_tensor, score_nchw, score_channels, score_h, score_w, c, y, x);
+                int8_t score = scores[offset];
+                if (score > threshold && score > max_raw)
+                {
+                    max_raw = score;
+                    max_offset = offset;
+                    class_id = c;
+                }
+            }
+
+            if (class_id >= 0)
+            {
+                max_score = Dequant(score_tensor, max_offset);
+            }
+            return class_id >= 0;
+        }
+
+        if (score_tensor.attr.type == NN_TENSOR_UINT8)
+        {
+            const uint8_t threshold = QuantizeThresholdU8(objectThreshold, score_tensor.attr.zp, score_tensor.attr.scale);
+            const uint8_t *scores = reinterpret_cast<uint8_t *>(score_tensor.data);
+            uint8_t max_raw = std::numeric_limits<uint8_t>::min();
+            int max_offset = -1;
+
+            for (int c = 0; c < cls_count; c++)
+            {
+                int offset = TensorOffset(score_tensor, score_nchw, score_channels, score_h, score_w, c, y, x);
+                uint8_t score = scores[offset];
+                if (score > threshold && score > max_raw)
+                {
+                    max_raw = score;
+                    max_offset = offset;
+                    class_id = c;
+                }
+            }
+
+            if (class_id >= 0)
+            {
+                max_score = Dequant(score_tensor, max_offset);
+            }
+            return class_id >= 0;
+        }
+
+        float best = -1.0f;
+        for (int c = 0; c < cls_count; c++)
+        {
+            int offset = TensorOffset(score_tensor, score_nchw, score_channels, score_h, score_w, c, y, x);
+            float score = Dequant(score_tensor, offset);
+            if (score > objectThreshold && score > best)
+            {
+                best = score;
+                class_id = c;
+            }
+        }
+
+        if (class_id >= 0)
+        {
+            max_score = best;
+        }
+        return class_id >= 0;
+    }
+
     static int ProcessBranch(const tensor_data_s &box_tensor,
                              const tensor_data_s &score_tensor,
+                             const tensor_data_s *score_sum_tensor,
                              int stride,
                              std::vector<DetectRect> &detectRects)
     {
-        // 处理一个尺度分支：box_tensor 解码框，score_tensor 取最大类别分数。
         int box_channels = 0;
         int box_h = 0;
         int box_w = 0;
@@ -189,40 +318,71 @@ namespace yolo
             return -1;
         }
 
-        // yolo11n 官方优化模型这里通常是 64/4=16。
+        int score_sum_channels = 0;
+        int score_sum_h = 0;
+        int score_sum_w = 0;
+        bool score_sum_nchw = true;
+        if (score_sum_tensor != nullptr)
+        {
+            if (!GetTensorShape(*score_sum_tensor, score_sum_channels, score_sum_h, score_sum_w, score_sum_nchw))
+            {
+                return -1;
+            }
+            if (score_sum_channels != 1 || score_sum_h != box_h || score_sum_w != box_w)
+            {
+                NN_LOG_ERROR("YOLO11 score_sum grid mismatch: score_sum=%dx%dx%d box=%dx%d",
+                             score_sum_channels, score_sum_w, score_sum_h, box_w, box_h);
+                return -1;
+            }
+        }
+
         const int dfl_len = box_channels / 4;
         const int cls_count = std::min(score_channels, class_num);
         const int grid_len = box_h * box_w;
+        const size_t before_count = static_cast<size_t>(box_channels);
+        if (before_count > 128)
+        {
+            NN_LOG_ERROR("YOLO11 dfl channel too large: %d", box_channels);
+            return -1;
+        }
 
         for (int y = 0; y < box_h; y++)
         {
             for (int x = 0; x < box_w; x++)
             {
-                float max_score = -1.0f;
-                int class_id = -1;
-                for (int c = 0; c < cls_count; c++)
+                if (score_sum_tensor != nullptr)
                 {
-                    int score_offset = TensorOffset(score_tensor, score_nchw, score_channels, score_h, score_w, c, y, x);
-                    float score = Dequant(score_tensor, score_offset);
-                    if (score > max_score)
+                    int score_sum_offset = TensorOffset(*score_sum_tensor,
+                                                        score_sum_nchw,
+                                                        score_sum_channels,
+                                                        score_sum_h,
+                                                        score_sum_w,
+                                                        0,
+                                                        y,
+                                                        x);
+                    if (!TensorValuePassThreshold(*score_sum_tensor, score_sum_offset, objectThreshold))
                     {
-                        max_score = score;
-                        class_id = c;
+                        continue;
                     }
                 }
 
-                if (class_id < 0 || max_score < objectThreshold)
+                float max_score = 0.0f;
+                int class_id = -1;
+                if (!FindMaxClassScore(score_tensor,
+                                       score_nchw,
+                                       score_channels,
+                                       score_h,
+                                       score_w,
+                                       y,
+                                       x,
+                                       cls_count,
+                                       class_id,
+                                       max_score))
                 {
                     continue;
                 }
 
                 float before_dfl[128];
-                if (box_channels > static_cast<int>(sizeof(before_dfl) / sizeof(before_dfl[0])))
-                {
-                    NN_LOG_ERROR("YOLO11 dfl channel too large: %d", box_channels);
-                    return -1;
-                }
-
                 for (int k = 0; k < box_channels; k++)
                 {
                     int box_offset = TensorOffset(box_tensor, box_nchw, box_channels, box_h, box_w, k, y, x);
@@ -232,7 +392,6 @@ namespace yolo
                 float box[4];
                 ComputeDfl(before_dfl, dfl_len, box);
 
-                // 官方样例使用 grid + 0.5 作为网格中心，再结合 stride 映射回 640 输入坐标。
                 float grid_x = static_cast<float>(x) + 0.5f;
                 float grid_y = static_cast<float>(y) + 0.5f;
 
@@ -269,7 +428,7 @@ namespace yolo
     int GetYolo11DetectionResult(const std::vector<tensor_data_s> &outputs,
                                  std::vector<float> &DetectiontRects)
     {
-        // 支持官方 9 输出和去掉 score_sum 后的 6 输出；score_sum 分支不参与后处理。
+        // 9 输出模型使用 score_sum 快速过滤；6 输出模型没有 score_sum 时直接扫描类别分支。
         if (outputs.size() != 6 && outputs.size() != 9)
         {
             NN_LOG_ERROR("YOLO11 expects 6 outputs or 9 outputs, got %ld", outputs.size());
@@ -283,13 +442,13 @@ namespace yolo
         {
             const int box_idx = i * output_per_branch;
             const int score_idx = box_idx + 1;
-            if (ProcessBranch(outputs[box_idx], outputs[score_idx], kStrides[i], detectRects) != 0)
+            const tensor_data_s *score_sum_tensor = output_per_branch == 3 ? &outputs[box_idx + 2] : nullptr;
+            if (ProcessBranch(outputs[box_idx], outputs[score_idx], score_sum_tensor, kStrides[i], detectRects) != 0)
             {
                 return -1;
             }
         }
 
-        // 先按置信度排序，再按类别分别做 NMS。
         std::sort(detectRects.begin(), detectRects.end(),
                   [](const DetectRect &a, const DetectRect &b)
                   { return a.score > b.score; });
