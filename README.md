@@ -1,18 +1,13 @@
 # RK3588 YOLO11 多线程视频推理 Demo
 
+语言切换：中文 | [English](README_en.md)
+
 这是一个精简后的 RK3588 YOLO11 推理工程，只保留本地图片推理和本地视频/USB 摄像头推理。
 
 保留的 demo：
 
 - `img_demo`：单张图片推理
 - `thread_pool_demo`：本地视频或 USB 摄像头多线程推理，使用多个 RKNN context 并行跑 NPU
-
-已移除内容：
-
-- RTSP 推流服务相关代码
-- MPP 编解码相关代码
-- MediaKit 相关代码
-- 原推流配置文件
 
 YOLO11 后处理参考 Rockchip 官方样例：
 
