@@ -1,0 +1,28 @@
+# Build outputs
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Runtime outputs
+outputs/
+*.mp4.tmp
+result.jpg
+thread_pool_demo.mp4
+
+# Editor and OS local files
+.vscode/
+.vs/
+*.user
+*.suo
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
