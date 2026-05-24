@@ -113,6 +113,7 @@ nms_thresh=0.45
 
 - `show_window=0`：不弹窗，只推理/保存视频，适合 SSH 或无桌面环境
 - `show_window=1`：弹出 OpenCV 窗口，按原视频帧尺寸显示推理结果，窗口中按 `q` 或 `Esc` 退出
+- 如果希望弹窗显示时仍尽量拉高 NPU 利用率，使用 `benchmark=1` 和 `show_window=1`。此时显示线程只展示最新完成帧，旧帧会被丢弃，不会按帧号阻塞推理线程。
 
 ## 非阻塞 benchmark 模式
 
@@ -120,6 +121,7 @@ nms_thresh=0.45
 
 ```ini
 benchmark=1
+show_window=1
 threads=12
 benchmark_seconds=30
 ```
@@ -133,15 +135,16 @@ benchmark_seconds=30
 benchmark 模式会自动：
 
 - 关闭 `record`
-- 关闭 `show_window`
-- 关闭画框和图像结果缓存
+- `show_window=0` 时关闭图像缓存，只统计纯推理吞吐
+- `show_window=1` 时弹窗显示最新完成帧，并只给显示出来的帧画框
 - 对文件视频自动循环
-- 非阻塞回收任意已完成结果，不再按帧号等待，减少结果线程对推理流水线的回压
+- 非阻塞回收结果，不再按帧号等待，减少结果线程对推理流水线的回压
 
 日志示例：
 
 ```text
 [NN_INFO] benchmark FPS:120.312500, Submitted:3600, Done:3588, Pending:12, Detections:42
+[NN_INFO] benchmark FPS:118.500000, DisplayFPS:58.000000, Submitted:3600, Done:3588, Pending:12, Detections:42
 ```
 
 这组日志适合配合下面命令观察 NPU：
@@ -160,6 +163,12 @@ watch -n 1 sudo cat /sys/kernel/debug/rknpu/load
 
 ```sh
 ./thread_pool_demo ../weights/yolo11n.rknn ../medias/palace.mp4 0 12 ../coco_80_labels_list.txt 80 0.25 0.45 0 thread_pool_demo.mp4 1 30
+```
+
+打开带弹窗的非阻塞 benchmark：
+
+```sh
+./thread_pool_demo ../weights/yolo11n.rknn ../medias/palace.mp4 0 12 ../coco_80_labels_list.txt 80 0.25 0.45 1 thread_pool_demo.mp4 1 30
 ```
 
 参数说明：

@@ -9,6 +9,7 @@ Yolov11ThreadPool::Yolov11ThreadPool()
 {
     stop_ = false;
     draw_result_ = true;
+    save_source_image_ = false;
 }
 
 Yolov11ThreadPool::~Yolov11ThreadPool()
@@ -95,7 +96,7 @@ void Yolov11ThreadPool::worker(int id)
         instance->Run(task.second, detections);
 
         {
-            // benchmark 模式只保存检测框，不画图也不缓存图像，减少 CPU 和内存带宽占用。
+            // benchmark 模式默认只保存检测框；实时显示模式额外保存原图，并只在显示线程画最新帧。
             std::lock_guard<std::mutex> lock(result_mutex_);
             results_[task.first] = detections;
             if (draw_result_.load())
@@ -103,6 +104,10 @@ void Yolov11ThreadPool::worker(int id)
                 img_source_[task.first] = task.second;
                 DrawDetections(task.second, detections);
                 img_results_[task.first] = task.second;
+            }
+            else if (save_source_image_.load())
+            {
+                img_source_[task.first] = task.second;
             }
         }
         cv_task_.notify_all();
@@ -230,9 +235,48 @@ nn_error_e Yolov11ThreadPool::getTargetResultNonBlockAndSourceImg(std::vector<De
     return NN_SUCCESS;
 }
 
+nn_error_e Yolov11ThreadPool::getLatestResultNonBlockAndSourceImg(std::vector<Detection> &objects,
+                                                                  cv::Mat &img,
+                                                                  int &id,
+                                                                  int &dropped_count)
+{
+    std::lock_guard<std::mutex> lock(result_mutex_);
+    if (results_.empty())
+    {
+        return NN_RESULT_NOT_READY;
+    }
+
+    auto latest = results_.rbegin();
+    id = latest->first;
+    objects = latest->second;
+
+    auto img_it = img_source_.find(id);
+    if (img_it != img_source_.end())
+    {
+        img = img_it->second;
+    }
+
+    dropped_count = 0;
+    while (!results_.empty() && results_.begin()->first <= id)
+    {
+        int old_id = results_.begin()->first;
+        results_.erase(results_.begin());
+        img_results_.erase(old_id);
+        img_source_.erase(old_id);
+        dropped_count++;
+    }
+
+    return img.empty() ? NN_RESULT_NOT_READY : NN_SUCCESS;
+}
+
 void Yolov11ThreadPool::setDrawResult(bool enabled)
 {
     draw_result_ = enabled;
+}
+
+void Yolov11ThreadPool::setSaveSourceImage(bool enabled)
+{
+    save_source_image_ = enabled;
 }
 
 void Yolov11ThreadPool::stopAll()

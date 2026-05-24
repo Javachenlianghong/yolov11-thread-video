@@ -31,7 +31,12 @@ public:
     nn_error_e getTargetResultNonBlock(std::vector<Detection> &objects, int id);
     nn_error_e getAnyTargetResultNonBlock(std::vector<Detection> &objects, int &id);
     nn_error_e getTargetResultNonBlockAndSourceImg(std::vector<Detection> &objects, cv::Mat &img, int id);
+    nn_error_e getLatestResultNonBlockAndSourceImg(std::vector<Detection> &objects,
+                                                   cv::Mat &img,
+                                                   int &id,
+                                                   int &dropped_count);
     void setDrawResult(bool enabled);
+    void setSaveSourceImage(bool enabled);
     void stopAll();
 
 private:
@@ -51,6 +56,7 @@ private:
     std::condition_variable cv_task_;
     std::atomic<bool> stop_;
     std::atomic<bool> draw_result_;
+    std::atomic<bool> save_source_image_;
 };
 
 #endif // RK3588_DEMO_YOLOV11_THREAD_POOL_H

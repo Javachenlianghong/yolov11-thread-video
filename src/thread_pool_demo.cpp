@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 
+#include "draw/cv_draw.h"
 #include "task/yolov11_thread_pool.h"
 #include "utils/logging.h"
 
@@ -334,7 +335,25 @@ static void get_benchmark_results(const VideoDemoConfig &config)
     auto start = std::chrono::steady_clock::now();
     auto last = start;
     int frame_count = 0;
+    int display_count = 0;
     int detect_count = 0;
+    int last_display_id = -1;
+    std::string fps_str;
+    bool show_window = config.show_window;
+
+    if (show_window)
+    {
+        try
+        {
+            // benchmark 弹窗按原始帧尺寸显示；显示慢时丢旧帧，避免反压推理线程。
+            cv::namedWindow("YOLO11 Thread Pool Demo", cv::WINDOW_AUTOSIZE);
+        }
+        catch (const cv::Exception &e)
+        {
+            NN_LOG_ERROR("failed to create display window: %s", e.what());
+            show_window = false;
+        }
+    }
 
     while (!g_user_stop.load())
     {
@@ -347,14 +366,61 @@ static void get_benchmark_results(const VideoDemoConfig &config)
 
         std::vector<Detection> objects;
         int frame_id = -1;
-        auto ret = g_yolov11_thread_pool->getAnyTargetResultNonBlock(objects, frame_id);
-        if (ret == NN_SUCCESS)
+        int consumed_count = 1;
+        nn_error_e ret = NN_RESULT_NOT_READY;
+
+        if (show_window)
         {
-            g_frame_end_id++;
-            frame_count++;
-            detect_count += static_cast<int>(objects.size());
+            cv::Mat img;
+            ret = g_yolov11_thread_pool->getLatestResultNonBlockAndSourceImg(objects, img, frame_id, consumed_count);
+            if (ret == NN_SUCCESS)
+            {
+                g_frame_end_id += consumed_count;
+                frame_count += consumed_count;
+                detect_count += static_cast<int>(objects.size());
+
+                if (frame_id > last_display_id)
+                {
+                    DrawDetections(img, objects);
+                    if (!fps_str.empty())
+                    {
+                        cv::putText(img, fps_str, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.8,
+                                    cv::Scalar(0, 0, 255), 2);
+                    }
+                    try
+                    {
+                        cv::imshow("YOLO11 Thread Pool Demo", img);
+                        int key = cv::waitKey(1);
+                        if (key == 27 || key == 'q' || key == 'Q')
+                        {
+                            NN_LOG_INFO("display window requested stop.");
+                            g_user_stop = true;
+                            g_read_end = true;
+                            break;
+                        }
+                    }
+                    catch (const cv::Exception &e)
+                    {
+                        NN_LOG_ERROR("display window failed: %s", e.what());
+                        show_window = false;
+                    }
+                    last_display_id = frame_id;
+                    display_count++;
+                }
+            }
         }
         else
+        {
+            ret = g_yolov11_thread_pool->getAnyTargetResultNonBlock(objects, frame_id);
+            if (ret == NN_SUCCESS)
+            {
+                g_frame_end_id++;
+                frame_count++;
+                detect_count += static_cast<int>(objects.size());
+            }
+        }
+
+        if (ret != NN_SUCCESS)
         {
             if (g_read_end.load() && g_frame_end_id.load() >= g_frame_start_id.load())
             {
@@ -368,21 +434,41 @@ static void get_benchmark_results(const VideoDemoConfig &config)
         if (elapsed_ms > 1000.0f)
         {
             float fps_value = frame_count / (elapsed_ms / 1000.0f);
+            float display_fps_value = display_count / (elapsed_ms / 1000.0f);
             int submitted = g_frame_start_id.load();
             int completed = g_frame_end_id.load();
-            NN_LOG_INFO("benchmark FPS:%f, Submitted:%d, Done:%d, Pending:%d, Detections:%d",
-                        fps_value,
-                        submitted,
-                        completed,
-                        submitted - completed,
-                        detect_count);
+            if (show_window)
+            {
+                NN_LOG_INFO("benchmark FPS:%f, DisplayFPS:%f, Submitted:%d, Done:%d, Pending:%d, Detections:%d",
+                            fps_value,
+                            display_fps_value,
+                            submitted,
+                            completed,
+                            submitted - completed,
+                            detect_count);
+            }
+            else
+            {
+                NN_LOG_INFO("benchmark FPS:%f, Submitted:%d, Done:%d, Pending:%d, Detections:%d",
+                            fps_value,
+                            submitted,
+                            completed,
+                            submitted - completed,
+                            detect_count);
+            }
+            fps_str = std::to_string(static_cast<int>(fps_value)) + " FPS";
             frame_count = 0;
+            display_count = 0;
             detect_count = 0;
             last = now;
         }
     }
 
     g_yolov11_thread_pool->stopAll();
+    if (show_window)
+    {
+        cv::destroyWindow("YOLO11 Thread Pool Demo");
+    }
     NN_LOG_INFO("benchmark end. submitted=%d, done=%d", g_frame_start_id.load(), g_frame_end_id.load());
 }
 
@@ -472,9 +558,8 @@ int main(int argc, char **argv)
     }
     if (config.benchmark)
     {
-        // benchmark 模式只测推理流水线吞吐：不保存、不显示、不画框，并循环视频让 NPU 持续有输入。
+        // benchmark 模式不保存视频；show_window=1 时仍会弹窗显示最新完成帧。
         config.record = false;
-        config.show_window = false;
         config.loop_video = !is_camera_id(config.video_source.c_str());
         if (config.benchmark_seconds <= 0)
         {
@@ -513,6 +598,7 @@ int main(int argc, char **argv)
         return ret;
     }
     g_yolov11_thread_pool->setDrawResult(!config.benchmark);
+    g_yolov11_thread_pool->setSaveSourceImage(config.benchmark && config.show_window);
 
     std::thread read_video_thread(read_video, config.video_source.c_str(), config.loop_video);
     std::thread result_thread;
